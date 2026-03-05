@@ -1,5 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import StreamingResponse
+from flask import Flask, request, send_file
 import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -9,8 +8,9 @@ from pptx.enum.text import PP_ALIGN
 import collections
 import io
 
-app = FastAPI()
+app = Flask(__name__)
 
+# Color Logic
 COLOR_MAP = {
     'Strong Offshore Opp': "#329B24",
     'Possible Offshore Opp': "#FFCA1A",
@@ -23,15 +23,15 @@ COLOR_MAP = {
 def hex_to_rgb(hex_color):
     hex_color = str(hex_color).lstrip('#')
     if hex_color in ["nan", "None", ""]: return (0, 0, 113)
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 def send_to_back(shape, slide):
     spTree = slide.shapes._spTree
     spTree.remove(shape._element)
     spTree.insert(2, shape._element)
 
-# Modified core function to take DataFrame and return BytesIO
-def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
+def generate_ppt_buffer(df):
+    """Core logic remains EXACTLY the same, but saves to memory instead of disk"""
     nodes = {}
     edges = collections.defaultdict(list)
 
@@ -40,8 +40,8 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
     nodes['CEO'] = {'title': 'CEO', 'subtitle': ceo_name, 'color': COLOR_MAP['None'], 'is_count': False}
 
     managers = set(df['Reports to'].dropna().unique())
+
     depts = [str(d) for d in df['Department'].unique() if str(d) != 'nan' and str(d).strip() != '']
-    
     for d in depts:
         dept_id = f"DEPT_{d}"
         nodes[dept_id] = {'title': d, 'subtitle': 'Department', 'color': COLOR_MAP['Dept'], 'is_count': False}
@@ -74,8 +74,11 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
         elif manager in nodes:
             edges[manager].append(node_id)
 
+    # LAYOUT ALGORITHM
     base_box_w, base_box_h = Inches(1.6), Inches(0.65)
-    gap_x, gap_y = Inches(0.4), Inches(1.3)
+    gap_x = Inches(0.4) 
+    gap_y = Inches(1.3) 
+
     leaf_widths = {}
 
     def calc_width(n):
@@ -93,19 +96,26 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
         if not edges[n]:
             coords[n] = (x_start + base_box_w / 2, y)
             return
+
         current_x = x_start
         child_centers = []
         for c in edges[n]:
             assign_coords(c, current_x, y + base_box_h + gap_y)
             child_centers.append(coords[c][0])
             current_x += leaf_widths[c] + gap_x
-        parent_x = child_centers[0] if len(child_centers) == 1 else (child_centers[0] + child_centers[-1]) / 2
+
+        if len(child_centers) == 1:
+            parent_x = child_centers[0]
+        else:
+            parent_x = (child_centers[0] + child_centers[-1]) / 2
+
         coords[n] = (parent_x, y)
 
     assign_coords('CEO', Inches(0.5), Inches(0.5))
 
     max_x = max(x for x, y in coords.values()) + base_box_w
     max_y = max(y for x, y in coords.values()) + base_box_h + Inches(1)
+
     MAX_PPT = Inches(54)
     scale = min(MAX_PPT / max_x, MAX_PPT / max_y) if max_x > MAX_PPT or max_y > MAX_PPT else 1.0
 
@@ -113,6 +123,7 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
     prs.slide_width = max(Inches(13.33), int(max_x * scale))
     prs.slide_height = max(Inches(7.5), int(max_y * scale))
     slide = prs.slides.add_slide(prs.slide_layouts[6])
+
     drawn_shapes = {}
 
     for n_id, (raw_x, raw_y) in coords.items():
@@ -141,11 +152,12 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
         sub_rect = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, sub_x, sub_y, sub_w, sub_h)
         sub_rect.fill.solid()
         sub_rect.fill.fore_color.rgb = RGBColor(255, 255, 255)
-        
+
         sp = sub_rect.text_frame.paragraphs[0]
         sp.text = str(data['subtitle'])
         sp.font.size, sp.font.color.rgb = sub_font, RGBColor(0, 0, 0)
         sp.alignment = PP_ALIGN.CENTER
+
         drawn_shapes[n_id] = rect
 
     for parent, children in edges.items():
@@ -154,6 +166,7 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
         for child in children:
             if child not in drawn_shapes: continue
             c_shape = drawn_shapes[child]
+
             conn = slide.shapes.add_connector(MSO_CONNECTOR.ELBOW, 0, 0, 0, 0)
             conn.begin_connect(p_shape, 2)
             conn.end_connect(c_shape, 0)
@@ -161,25 +174,43 @@ def generate_pptx_in_memory(df: pd.DataFrame) -> io.BytesIO:
             conn.line.width = Pt(1.5 * scale)
             send_to_back(conn, slide)
 
-    # VERCEL FIX: Save to Memory Buffer instead of Hard Drive
-    pptx_io = io.BytesIO()
-    prs.save(pptx_io)
-    pptx_io.seek(0)
-    return pptx_io
+    # Magic happens here: Save to memory instead of disk
+    memory_file = io.BytesIO()
+    prs.save(memory_file)
+    memory_file.seek(0)
+    return memory_file
 
-# API ENDPOINT
-@app.post("/generate")
-async def generate_chart(file: UploadFile = File(...)):
-    # 1. Read Excel file directly from memory
-    contents = await file.read()
-    df = pd.read_excel(io.BytesIO(contents))
+@app.route('/', methods=['GET'])
+def health_check():
+    return "Org Chart API is running! Send a POST request to /generate with an Excel file.", 200
+
+@app.route('/generate', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return {"error": "No file part in the request"}, 400
+        
+    file = request.files['file']
     
-    # 2. Generate PPTX in memory
-    pptx_file = generate_pptx_in_memory(df)
-    
-    # 3. Return as a downloadable file
-    return StreamingResponse(
-        pptx_file, 
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": f"attachment; filename=OrgChart_Generated.pptx"}
-    )
+    if file.filename == '':
+        return {"error": "No selected file"}, 400
+
+    try:
+        # Read Excel directly from the uploaded file stream
+        df = pd.read_excel(file)
+        
+        # Generate the PPTX buffer
+        ppt_buffer = generate_ppt_buffer(df)
+        
+        # Return as a downloadable file
+        return send_file(
+            ppt_buffer,
+            as_attachment=True,
+            download_name="Perfect_Structure_OrgChart.pptx",
+            mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+# Vercel needs this
+if __name__ == "__main__":
+    app.run(debug=True)
